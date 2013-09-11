@@ -10,6 +10,7 @@ Files are read using the pandas (www.github.com/pydata/pandas) package.
 Currently, the ba2D.py file solves the pose graph problem in 2D.
 
 Some toggles:
+
 _SAVE_DATA : save intermediate data to disk (warning, Hessian saved in dense format)
 
 _SAVE_RESULT : save solution to disk
