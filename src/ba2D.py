@@ -2,7 +2,7 @@
 
 ## code to solve 2D pose-only bundle adjustment using PyOP2
 import numpy as np
-import ba_data
+import badata
 import balib
 from pyop2 import op2, petsc_base
 import pprint as pp
@@ -18,31 +18,32 @@ from functools import partial
 reserved_names = ['estimate', 'poses', 'err', 'omega', 'sse', 'J', 'H', 'i',
                   'j', 'rhs_vector', 'idx', 'idx1', 'idx2']
 
-_SAVE_DATA = True
-_SAVE_RESULT = True
+_USE_HUBER = False
+_SAVE_DATA = False
+_SAVE_RESULT = False
 _DEBUG = False
 _PRINT_CODE = False
 _VERBOSE = False
 _PROFILE = False
-_SOLVE = False
+_SOLVE = True
 SOLVER_TYPE = 'cg'
 PRECON = 'jacobi'
 MAX_ITER = 1
 
 _expr_count = 0
-vertices, edges = ba_data.quickLoad(ba_data.MANHATTAN)
+V, E = badata.quickLoad(badata.MANHATTAN)
 if _VERBOSE:
-    print vertices.head()
-    print edges.head()
+    print V.head()
+    print E.head()
 
 POSES_PER_CONSTRAINT = 2
 
-POSES_DIM = balib.dim_lookup[vertices.label.unique()[0]]
-CONSTRAINT_DIM = balib.dim_lookup[edges.label.unique()[0]]
+POSES_DIM = balib.dim_lookup[V.label.unique()[0]]
+CONSTRAINT_DIM = balib.dim_lookup[E.label.unique()[0]]
 OMEGA_DOF = balib.omega_dof(CONSTRAINT_DIM)
 
-NUM_POSES = len(vertices)
-NUM_CONSTRAINTS = len(edges)
+NUM_POSES = len(V)
+NUM_CONSTRAINTS = len(E)
 
 op2.init(backend='sequential')
 
@@ -86,7 +87,7 @@ def testKernel(data=None, op2set=None, op2map=None):
     print '-' * 80
 
 
-def preprocess():
+def preprocess(vertices=V, edges=E):
     """ Initial step to create PyOP2 Sets and Maps with correct dimensions
         to create indirection for the graph problem:
         1) poses is a Set of all poses (parameter blocks)
@@ -96,6 +97,13 @@ def preprocess():
             of data based on dimension of constraints_to_poses
         5) poses_to_poses maps poses to data based on dimension of poses
     """
+    global NUM_POSES, NUM_CONSTRAINTS, POSES_DIM, CONSTRAINT_DIM, POSES_PER_CONSTRAINT
+
+    if (not vertices is None) and (not edges is None):
+        NUM_CONSTRAINTS = len(edges)
+        NUM_POSES = len(vertices)
+
+
     poses = op2.Set(NUM_POSES, 'poses')
     constraints = op2.Set(NUM_CONSTRAINTS, 'constraints')
 
@@ -136,8 +144,9 @@ def preprocess():
             constraints_to_constraints, poses_to_poses, initial_to_poses)
 
 
-def setupData(poses, constraints):
+def setupData(poses, constraints, vertices=V, edges=E):
     """ setting up Dat objects from the loaded vertex and edge DataFrames
+        0) x is the Dat of pose parameters we are optimizing
         1) err is the large vector of measurement errors
         2) estimate is the estimate we will calculate based on parameters
         3) measurement is the actual measurement between vertices
@@ -160,7 +169,7 @@ def setupData(poses, constraints):
                 data=vertices[pose_slice].values.reshape(POSES_DIM, NUM_POSES),
                 dtype=np.float64,
                 name='x')
-    
+
     if _DEBUG:
         print '-' * 80
         print 'ba vertices:'
@@ -196,7 +205,7 @@ def setupData(poses, constraints):
             rhs_vec, dx, sse, sse_arr)
 
 
-def setuphessian(poses, constraints_to_poses):
+def setupHessian(poses, constraints_to_poses):
     """ define the sparsity pattern of the hessian and return the Mat """
     hess_sparsity = op2.Sparsity((poses ** POSES_DIM, poses ** POSES_DIM),
                                  (constraints_to_poses, constraints_to_poses),
@@ -214,8 +223,8 @@ def generateEstimateCode(name, funcs):
        inefficiently processes strings, but does this O(1) times.
        called as follows:
        op2.par_loop(estimate_poses, pose_constraints,
-                    pose_dat(constraints_to_poses, op2.READ),
-                    estimate(op2.IdentityMap, op2.WRITE))
+                    pose_dat(op2.READ, constraints_to_poses),
+                    estimate(op2.WRITE))
     """
 
     if not hasattr(funcs, '__len__'):
@@ -260,9 +269,9 @@ def generateErrorCode(name, funcs):
         to calculate error vector
         called as follows:
         op2.par_loop(pose_error, pose_constraints,
-                     e(op2.IdentityMap, op2.WRITE),
-                     estimate(op2.IdentityMap, op2.READ),
-                     measurement(op2.IdentityMap, op2.READ))
+                     e(op2.WRITE),
+                     estimate(op2.READ),
+                     measurement(op2.READ))
     """
 
     if not hasattr(funcs, '__len__'):
@@ -305,8 +314,8 @@ def generateSSECode(name):
     """pass in a name and get back a Kernel to compute the sum of squares
        called in the following way:
        op2.par_loop(kernel, constraints,
-                    e(op2.IdentityMap, op2.READ),
-                    omega_blocks(op2.IdentityMap, op2.READ),
+                    e(op2.READ),
+                    omega_blocks(op2.READ),
                     F(op2.INC))
     """
 
@@ -319,7 +328,7 @@ def generateSSECode(name):
 
     sse_code = """
     void %(name)s(double err[%(c_dim)d], double omega[%(omega_dim)d],
-                  double array[1], double *sse) //, double array[1])
+                  double array[1], double *sse)
     {
         array[0] = %(loop)s;
         *sse += array[0];
@@ -333,6 +342,47 @@ def generateSSECode(name):
     if _PRINT_CODE:
         print sse_code
     return op2.Kernel(sse_code, name)
+
+
+def generateHuberSSECode(name, huber_param):
+    """ similar to SSE, exept for the Huber formula, which is more
+        forgiving of outliers.  The function applies the SSE until
+        some value 'b', then is linear thereafter
+    """
+
+    ij = [(i, j) for i in xrange(CONSTRAINT_DIM)
+          for j in xrange(CONSTRAINT_DIM) if j >= i]
+    unrolled_loop = []
+
+    for idx, (i, j) in enumerate(ij):
+        unrolled_loop.append('%f * err[%d]*omega[%d]*err[%d]' %
+                              (2 - (i == j), i, idx, j))
+
+
+    huber_sse_code = """
+    void %(name)s(double err[%(c_dim)d], double omega[%(omega_dim)d],
+                  double array[1], double * sse)
+    {
+        double value = %(loop)s;
+        double sqrtval = sqrt(value);
+        if (sqrtval < %(epsilon)f) {
+            array[0] = value;
+            
+        } else {
+            array[0] = 2*%(epsilon)f * sqrtval - %(epsilon)f * %(epsilon)f;
+        }
+        *sse += array[0];
+    }
+    """ % {'name': name,
+           'c_dim': CONSTRAINT_DIM,
+           'omega_dim': OMEGA_DOF,
+           'loop': ' + '.join(unrolled_loop),
+           'epsilon': huber_param}
+
+    if _PRINT_CODE:
+        print huber_sse_code
+
+    return op2.Kernel(huber_sse_code, name)
 
 
 def generateJacobianCode(name, funcs):
@@ -438,7 +488,7 @@ def generateRHSCode(name):
     return op2.Kernel(rhs_code, name)
 
 
-def generatehessianCode(name, lm_param):
+def generateHessianCode(name, lm_param):
     """pass in a name string and a float representing the Levenberg-Marquardt
        parameter for H + lm_param * D
        The hessian is a NUM_POSES*POSES_DIM by NUM_POSES*POSES_DIM square
@@ -487,38 +537,38 @@ def generatehessianCode(name, lm_param):
            'update': '\n'.join(update),
            'j_dim': JBLOCK_SIZE * POSES_PER_CONSTRAINT}
 
-    lm_kernel = generatehessianDiagonalCode(name + '_lm', lm_param)
+    lm_kernel = generateHessianDiagonalCode(name + '_lm', lm_param)
     if _PRINT_CODE:
         print hessian_code
     return op2.Kernel(hessian_code, name), lm_kernel
 
 
-def generatehessianInitialCode(name):
-    """ updates the first pose to make matrix non singular
-        called:
-        op2.par_loop(initial, initial_to_poses,
-                     hessian((poses[op2.i[0]], poses[op2.i[0]]), op2.INC))
-    """
+# def generatehessianInitialCode(name):
+#     """ updates the first pose to make matrix non singular
+#         called:
+#         op2.par_loop(initial, initial_to_poses,
+#                      hessian((poses[op2.i[0]], poses[op2.i[0]]), op2.INC))
+#     """
 
-    initial_code = """
-    void %(name)s(double H[%(p_dim)d][%(p_dim)d], int i, int j) {
-        //std::cout << "test" << std::endl;
-        int idx1, idx2;
-        for ( idx1 = 0; idx1 < %(p_dim)d; ++idx1 ) {
-            for ( idx2 = 0; idx2 < %(p_dim)d; ++idx2 ) {
-                H[idx1][idx2] *= 2.;
-            }
-        }
-    }
-    """ % {'name': name, 'p_dim': POSES_DIM}
+#     initial_code = """
+#     void %(name)s(double H[%(p_dim)d][%(p_dim)d], int i, int j) {
+#         //std::cout << "test" << std::endl;
+#         int idx1, idx2;
+#         for ( idx1 = 0; idx1 < %(p_dim)d; ++idx1 ) {
+#             for ( idx2 = 0; idx2 < %(p_dim)d; ++idx2 ) {
+#                 H[idx1][idx2] *= 2.;
+#             }
+#         }
+#     }
+#     """ % {'name': name, 'p_dim': POSES_DIM}
 
-    if _PRINT_CODE:
-        print initial_code
+#     if _PRINT_CODE:
+#         print initial_code
 
-    return op2.Kernel(initial_code, name)
+#     return op2.Kernel(initial_code, name)
 
 
-def generatehessianDiagonalCode(name, lm_param):
+def generateHessianDiagonalCode(name, lm_param):
     """ this updates the matrix via the lm_param value
         called as follows:
         op2.par_loop( diag_kernel, poses(1,1),
@@ -583,14 +633,14 @@ def runBA():
         pr.enable()
 
     times = {'sse': [], 'estimate': [], 'error': [], 'jacobian': [],
-             'rhs': [], 'lhs': [], 'solve': []}
+             'rhs': [], 'lhs': [], 'solve': [], 'save': [], 'lazy': []}
     t0 = time.time()
     poses, constraints, initial, constraints_to_poses, constraints_to_constraints, poses_to_poses, initial_to_poses = preprocess()
     times['preprocess'] = (time.time() - t0)
 
     t0 = time.time()
     err, x, estimate, measurement, jacobian_blocks, omega_blocks, rhs_vec, dx, sse, sse_arr = setupData(poses, constraints)
-    hessian = setuphessian(poses, constraints_to_poses)
+    hessian = setupHessian(poses, constraints_to_poses)
     times['setup_data'] = (time.time() - t0)
 
     t0 = time.time()
@@ -598,10 +648,13 @@ def runBA():
     se2_updates = [x_update, y_update, theta_update]
     estimate_kernel = generateEstimateCode('estimation', se2_funcs)
     error_kernel = generateErrorCode('errorize', se2_funcs)
-    sse_kernel = generateSSECode('sum_of_squares')
+    if _USE_HUBER:
+        sse_kernel = generateHuberSSECode('sum_of_squares', 1.0)
+    else:
+        sse_kernel = generateSSECode('sum_of_squares')
     jacobian_kernel = generateJacobianCode('jacobian_block', se2_funcs)
     rhs_kernel = generateRHSCode('rhs')
-    lhs_kernel, lm_kernel = generatehessianCode('lhs', 0.)
+    lhs_kernel, lm_kernel = generateHessianCode('lhs', 0.)
     update_kernel = generateUpdate(se2_updates)
     times['kernels'] = (time.time() - t0)
 
@@ -685,15 +738,6 @@ def runBA():
         times['lhs'].append((time.time() - t0))
 
         t0 = time.time()
-        if _SAVE_DATA:
-            np.save('error%d' % n, err.data)
-            np.save('jacobians%d' % n, jacobian_blocks.data)
-            np.save('omega', omega_blocks.data)
-            np.save('hessian%d' % n, hessian.values)
-            np.save('sse%d' % n, sse_arr.data)
-            np.save('rhs%d' % n, rhs_vec.data)
-
-        t0 = time.time()
         if _SOLVE:
             solver.solve(hessian, dx, rhs_vec)
             op2.par_loop(update_kernel, poses,
@@ -701,8 +745,24 @@ def runBA():
                          x(op2.RW))
         times['solve'].append((time.time() - t0))
         # print np.linalg.norm(dx.data)
+
+        t0 = time.time()
+        if _SAVE_DATA:
+            np.save('../output/x%d' % n, x.data)
+            np.save('../output/estimate%d' % n, estimate.data)
+            np.save('../output/error%d' % n, err.data)
+            np.save('../output/jacobians%d' % n, jacobian_blocks.data)
+            np.save('../output/omega', omega_blocks.data)
+            np.save('../output/hessian%d' % n, hessian.values)
+            np.save('../output/sse%d' % n, sse_arr.data)
+            np.save('../output/rhs%d' % n, rhs_vec.data)
+        times['save'].append((time.time() - t0))
+
+        t0 = time.time()
+        dx.data
+        times['lazy'].append((time.time() - t0))
         n += 1
-        
+
     if _PROFILE:
         pr.disable()
         ps = pstats.Stats(pr)
@@ -718,7 +778,7 @@ def runBA():
     print 'initial error: %f' % errors[0]
     print 'final error: %f' % errors[-1]
     if _SAVE_RESULT:
-        np.save('result', x.data)
+        np.save('../output/result', x.data)
 
 
 # code generation tools
@@ -786,9 +846,9 @@ def e_theta(p_x, p_y, p_theta, q_x, q_y, q_theta):
         much more roundabout way
     """
     theta = q_theta - p_theta
-    return Piecewise((theta, theta >= -np.pi and theta < np.pi),
-                     (theta + 2*np.pi, theta < -np.pi),
-                     (theta - 2*np.pi, theta >= np.pi))
+    return Piecewise((theta + 2*np.pi, theta < -np.pi),
+                     (theta - 2*np.pi, theta >= np.pi),
+                     (theta, True))
 
 
 def x_update(p_x, p_y, p_theta, dx, dy, dtheta):

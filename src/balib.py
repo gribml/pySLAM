@@ -12,6 +12,7 @@ Landmark3D = namedtuple('Landmark3D', ['x', 'y', 'z'])
 
 dim_lookup = {'R1': 1, 'R2': 2, 'R3': 3, 'SE2': 3, 'QUAT': 6}
 
+constraint_lookup = {'SE2': 2, 'R1': 2, 'R2': 2, 'R3': 2}
 
 def omega_dof(dim):
     """ calculate number of degrees of freedom (dof) of a (square

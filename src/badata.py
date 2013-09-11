@@ -1,21 +1,16 @@
+import os
 import csv
 import numpy as np
 import pandas as pd
 from collections import namedtuple
-import os
 
-WORKPATH = os.path.join(os.environ['HOME'], 'Dropbox', 'Imperial',
-                        'msc-project', 'BundleAdjustment', 'data')
-INTEL = os.path.join(WORKPATH, '2d', 'intel', 'intel.g2o')
-MANHATTAN = os.path.join(WORKPATH, '2d', 'manhattan3500', 'manhattanOlson3500.g2o')
-NEW_COLLEGE_G2O = os.path.join(WORKPATH, 'ba', 'new-college', 'newcollege3500.g2o')
+WORKPATH = os.path.join('..', 'data')
+INTEL = os.path.join(WORKPATH, 'intel.g2o')
+MANHATTAN = os.path.join(WORKPATH, 'manhattanOlson3500.g2o')
 
 EDGE_COLS = ['from_index', 'to_index', 'x_coord', 'y_coord', 'theta_coord', 'omega_0_0',
              'omega_0_1', 'omega_0_2', 'omega_1_1', 'omega_1_2', 'omega_2_2']
 VERTEX_COLS = ['index', 'x', 'y', 'theta']
-
-Vertex = namedtuple('Vertex', VERTEX_COLS)
-Edge = namedtuple('Edge', EDGE_COLS)
 
 
 def drop_empty(row):
@@ -35,12 +30,15 @@ def quickLoad(filepath, delim=' ', skip=0):
     edges = df.ix[edges_mask]
     vertices = df.ix[~edges_mask].dropna(axis=1)
 
+    def label_parser(val):
+        return val.split('_')[1].split(':')[0]
+
     vertices.rename(columns={'0': 'label', '1': 'index'}, inplace=True)
     vertices.rename(columns={str(i): 'dim%d' % (i - 1) for
                              i in range(2, len(vertices.columns))},
                     inplace=True)
     # replace the VERTEX_XXX label to just be XXX (more informative)
-    vertices['label'] = vertices['label'].apply(lambda val: val.split('_')[1])
+    vertices['label'] = vertices['label'].apply(label_parser)
     # reassign the vertices DataFrame
     edges.rename(columns={'0': 'label', '1': 'from_v', '2': 'to_v'}, inplace=True)
     edges.rename(columns={str(i): 'meas%d' % (i - 2) for
@@ -70,7 +68,7 @@ def loadFromFile(filepath):
 def g2o_to_iSAM(g2o_filepath):
     v, e = quickLoad(g2o_filepath)
     e.label = e.label.apply(lambda val: 'EDGE%d' % int(val[-1]))
-    outpath = g2o_filepath.split('.')[0] + '.isam'
+    outpath = os.path.join('..', 'data', g2o_filepath.split('.')[0] + '.isam')
     e.sort(columns='to_v', ascending=True).to_csv(outpath, sep=' ',
                                                   header=False, index=False)
     return outpath
