@@ -22,7 +22,7 @@ _USE_HUBER = False
 _SAVE_DATA = False
 _SAVE_RESULT = False
 _DEBUG = False
-_PRINT_CODE = False
+_PRINT_CODE = True
 _VERBOSE = False
 _PROFILE = False
 _SOLVE = True
@@ -385,7 +385,7 @@ def generateHuberSSECode(name, huber_param):
     return op2.Kernel(huber_sse_code, name)
 
 
-def generateJacobianCode(name, funcs):
+def generateJacobianCode(name, estimateFuncs, errorFuncs):
     """ pass in a name string and the error function having CONSTRAINT_DIM
         dimensions and get back a kernel which computes the generic jacobian
         block determined by the Jacobian of the funcs wrt each input;  The
@@ -397,13 +397,23 @@ def generateJacobianCode(name, funcs):
                      jacobian_blocks(op2.IdentityMap, op2.RW))
     """
     
-    if not hasattr(funcs, '__len__'):
-        funcs = [funcs] * CONSTRAINT_DIM
+    if not hasattr(estimateFuncs, '__len__'):
+        estimateFuncs = [estimateFuncs] * CONSTRAINT_DIM
+
+    if not hasattr(errorFuncs, '__len__'):
+        errorFuncs = [errorFuncs] * CONSTRAINT_DIM
 
     poses_symbols = []
     for k in xrange(POSES_PER_CONSTRAINT):
         poses_symbols.extend(sympy.symbols(', '.join(['poses[%d][%d]' %
                              (k, i) for i in xrange(POSES_DIM)])))
+
+    est_symbols = sympy.symbols(', '.join(['estimate[%d]' %
+                                           i for i in xrange(CONSTRAINT_DIM)]))
+
+    est_funcs = [estimateFuncs[i](*(poses_symbols)) for i in xrange(POSES_DIM)]
+    params = est_funcs + list(est_symbols)
+    funcs = [errorFuncs[i](*(params)) for i in xrange(CONSTRAINT_DIM)]
 
     code = []
     for i in xrange(POSES_PER_CONSTRAINT):
@@ -652,7 +662,7 @@ def runBA():
         sse_kernel = generateHuberSSECode('sum_of_squares', 1.0)
     else:
         sse_kernel = generateSSECode('sum_of_squares')
-    jacobian_kernel = generateJacobianCode('jacobian_block', se2_funcs)
+    jacobian_kernel = generateJacobianCode('jacobian_block', se2_funcs, se2_funcs)
     rhs_kernel = generateRHSCode('rhs')
     lhs_kernel, lm_kernel = generateHessianCode('lhs', 0.)
     update_kernel = generateUpdate(se2_updates)
@@ -812,20 +822,41 @@ def parse_return(code_string):
     return code_string[start:start + end]
 
 
+def partial_deriv(function, params, idx):
+    """ generates a partial derivative of 'function' wrt 'idx' """
+    name = 'd_%s_d_%s' % (function.func_name, (params)[idx])
+    code = codegen((name, function)), 'C', name)[0][1]
+    return ba2D.parse_return(code)
+
+
+def add_semicolon(code_string):
+    output = []
+    for line in code_string.split('\n'):
+        if (line[-1] not in ['}', '{']) and (line[-1] != ';'):
+            output.append('%s;' % line)
+        else:
+            output.append(line)
+    return '\n'.join(output)
+
+
 # definitions of measurement functions on different manifolds
 def landmark_x(p_x, p_y, p_theta, l_x, l_y):
+    """ symbolix x-component of pose-landmark measurement """
     return (p_x - l_x) * sympy.cos(p_theta) + (p_y - l_y) * sympy.sin(p_theta)
 
 
 def landmark_y(p_x, p_y, p_theta, l_x, l_y):
+    """ symbolix y-component of pose-landmark measurement """
     return -(p_x - l_x) * sympy.sin(p_theta) + (p_y - l_y) * sympy.cos(p_theta)
 
 
 def r2_x(p_x, p_y, q_x, q_y):
+    """ symbolix x-component of Euclidean R2 error """
     return q_x - p_x
 
 
 def r2_y(p_x, p_y, q_x, q_y):
+    """ symbolix y-component of Euclidean R2 error """
     return q_y - p_y
 
 
@@ -852,14 +883,23 @@ def e_theta(p_x, p_y, p_theta, q_x, q_y, q_theta):
 
 
 def x_update(p_x, p_y, p_theta, dx, dy, dtheta):
+    """ given an update (dx, dy, dtheta), produce the x coordinate of
+        SE2-position of updated (p_x, p_y, p_theta)
+    """
     return p_x + dx * sympy.cos(p_theta) - dy * sympy.sin(p_theta)
 
 
 def y_update(p_x, p_y, p_theta, dx, dy, dtheta):
+    """ given an update (dx, dy, dtheta), produce the y coordinate of
+        SE2-position of updated (p_x, p_y, p_theta)
+    """
     return p_y + dy * sympy.sin(p_theta) + dy * sympy.cos(p_theta)
 
 
 def theta_update(p_x, p_y, p_theta, dx, dy, dtheta):
+    """ given an update (dx, dy, dtheta), produce the theta coordinate
+        of SE2-position of updated (p_x, p_y, p_theta)
+    """
     theta = p_theta + dtheta
     return Piecewise((theta, theta >= -np.pi and theta < np.pi),
                      (theta + 2*np.pi, theta < -np.pi),
